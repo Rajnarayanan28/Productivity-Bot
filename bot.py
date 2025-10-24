@@ -1,69 +1,129 @@
 import os
-from dotenv import load_dotenv
 import time
-import datetime
-import asyncio
-
+import threading
+from datetime import datetime
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# State tracking for Pomodoro per user
-pomodoro_state = {}
-
 # Load environment variables
 load_dotenv()
-API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-async def pomodoro_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /pomodoro <topic>")
-        return
-    topic = ' '.join(context.args)
+# Dictionary to store sessions
+pomodoro_sessions = {}  # {user_id: {status, topic, end_time, timer, break_timer}}
+
+# Helper: minutes left
+def minutes_left(end_time):
+    return round((end_time - time.time()) / 60, 1)
+
+
+async def pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    args = context.args
 
-    end_time = time.time() + 25 * 60
-    pomodoro_state[user_id] = {'status': 'pomodoro', 'topic': topic, 'end_time': end_time}
-
-    now = datetime.datetime.now().strftime('%Y-%m-%d, \n %H:%M')
-    await update.message.reply_text(
-    f'Session for "{topic}" has started on {now}.'
-)
-    await asyncio.sleep(25 * 60)
-
-    if user_id in pomodoro_state and pomodoro_state[user_id]['status'] == 'pomodoro':
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Pomodoro timer is over! Take a 7 minute break."
+    # Case 1: No argument
+    if not args:
+        await update.message.reply_text(
+            "Usage: /pomodoro <topic>, /pomodoro status, or /pomodoro clear"
         )
-        pomodoro_state[user_id] = {'status': 'break', 'end_time': time.time() + 7 * 60}
-        await asyncio.sleep(7 * 60)
-        if user_id in pomodoro_state and pomodoro_state[user_id]['status'] == 'break':
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Break over, back to work?"
-            )
-            del pomodoro_state[user_id]
-
-async def pomodoro_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in pomodoro_state:
-        await update.message.reply_text("No pomodoro or break is running.")
         return
 
-    state = pomodoro_state[user_id]
-    seconds_left = int(state['end_time'] - time.time())
+    arg = " ".join(args).strip().lower()
 
-    if state['status'] == 'pomodoro' and seconds_left > 0:
-        await update.message.reply_text(f"Pomodoro running for '{state['topic']}'. {seconds_left//60} min {seconds_left%60} sec left.")
-    elif state['status'] == 'break' and seconds_left > 0:
-        await update.message.reply_text(f"Break time! {seconds_left//60} min {seconds_left%60} sec left.")
-    else:
-        await update.message.reply_text("No active pomodoro or break!")
+    # Case 2: Reserved subcommands
+    if arg in ["status", "clear"]:
+        if user_id not in pomodoro_sessions:
+            await update.message.reply_text(
+                "No session running. Start one first with /pomodoro <topic>."
+            )
+            return
 
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(API_TOKEN).build()
-    app.add_handler(CommandHandler("pomodoro", pomodoro_start))
-    app.add_handler(CommandHandler("pomodoro", pomodoro_start))
-    app.add_handler(CommandHandler("pomodoro_status", pomodoro_status))
-    print("Running Pomodoro Bot...")
+        session = pomodoro_sessions[user_id]
+
+        if arg == "status":
+            if session["status"] != "pomodoro":
+                await update.message.reply_text(
+                    "No pomodoro session is currently running."
+                )
+                return
+            left = minutes_left(session["end_time"])
+            await update.message.reply_text(
+                f'Session "{session["topic"]}" is currently running.\n'
+                f"You have {left} minute(s) left."
+            )
+            return
+
+        if arg == "clear":
+            if session.get("timer"):
+                session["timer"].cancel()
+            if session.get("break_timer"):
+                session["break_timer"].cancel()
+            del pomodoro_sessions[user_id]
+            await update.message.reply_text("All sessions cleared.")
+            return
+
+    # Case 3: Don't allow a new session if one is running
+    if user_id in pomodoro_sessions:
+        await update.message.reply_text(
+            "Finish or clear your current session before starting a new one."
+        )
+        return
+
+    # Case 4: Prevent 'status' or 'clear' as a topic
+    if arg in ["status", "clear"]:
+        await update.message.reply_text(
+            "Topic cannot be 'status' or 'clear'. Please enter a valid topic."
+        )
+        return
+
+    # Case 5: Start new Pomodoro session
+    start_time = datetime.now()
+    end_time = time.time() + 25 * 60  # 25 minutes
+
+    def pomodoro_done():
+        context.application.create_task(
+            update.message.reply_text("Pomodoro timer is over! Take a 7 minute break.")
+        )
+        session["status"] = "break"
+        session["end_time"] = time.time() + 7 * 60
+
+        def break_done():
+            context.application.create_task(
+                update.message.reply_text("Break over, back to work?")
+            )
+            pomodoro_sessions.pop(user_id, None)
+
+        session["break_timer"] = threading.Timer(7 * 60, break_done)
+        session["break_timer"].start()
+
+    timer = threading.Timer(25 * 60, pomodoro_done)
+
+    session = {
+        "status": "pomodoro",
+        "topic": arg,
+        "end_time": end_time,
+        "timer": timer,
+        "break_timer": None,
+    }
+    pomodoro_sessions[user_id] = session
+    timer.start()
+
+    await update.message.reply_text(
+        f'Session for "{arg}" has started on {start_time.strftime("%Y-%m-%d, %H:%M:%S")}.'
+    )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Pomodoro Bot is running! Use /pomodoro <topic> to start.")
+
+
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("pomodoro", pomodoro))
+
+    print("Running Pomodoro Bot (Python)...")
     app.run_polling()
