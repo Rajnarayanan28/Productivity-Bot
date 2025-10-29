@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import csv
 import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
@@ -11,6 +12,10 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+#Log File
+log_file = 'pomodoro_log.csv'
+log = []
 
 
 # Dictionary to store sessions
@@ -75,6 +80,16 @@ async def pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 session["timer"].cancel()
             if session.get("break_timer"):
                 session["break_timer"].cancel()
+            # Hidden: append cleared/stopped session to in-memory log
+            try:
+                log.append({
+                    "topic": session.get("topic", "<unknown>"),
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "stopped",
+                })
+                update_log_file(log)
+            except Exception:
+                pass
             del pomodoro_sessions[user_id]
             await update.message.reply_text("All sessions cleared.")
             return
@@ -125,6 +140,16 @@ async def pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             print("Error sending break message:", e)
+        # Hidden: append completed session to in-memory log
+        try:
+            log.append({
+                "topic": session.get("topic", "<unknown>"),
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "completed",
+            })
+            update_log_file(log)
+        except Exception:
+            pass
         pomodoro_sessions.pop(user_id, None)
 
 
@@ -148,6 +173,17 @@ async def pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pomodoro_sessions[user_id] = session
 
+    # Hidden: append started session to in-memory log
+    try:
+        log.append({
+            "topic": arg,
+            "time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "started",
+        })
+        update_log_file(log)
+    except Exception:
+        pass
+
 
     await update.message.reply_text(
         f'Session for "{arg}" has started on {start_time.strftime("%Y-%m-%d, %H:%M:%S")}.'
@@ -158,7 +194,20 @@ async def pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Pomodoro Bot is running! Use /pomodoro <topic> to start.")
 
-
+def update_log_file(log):
+    fieldnames = ["topic", "time", "status"]
+    try:
+        # Get only the latest entry
+        latest_entry = log[-1] if log else None
+        if latest_entry:
+            with open('output.csv', 'a', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                # Only write header if file is empty
+                if csvfile.tell() == 0:
+                    writer.writeheader()
+                writer.writerow(latest_entry)
+    except Exception as e:
+        print("Error writing to log file:", e)
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
